@@ -378,3 +378,59 @@ router.put("/api/purchases/:id", async (req, res) => {
     conn.release();
   }
 });
+
+// DELETE /api/purchases/:id
+router.delete("/api/purchases/:id", async (req, res) => {
+  const purchaseId = Number(req.params.id);
+  if (Number.isNaN(purchaseId))
+    return res.status(400).json({ error: "id inválido" });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [pRows] = await conn.query(
+      "SELECT * FROM purchases WHERE id = ? FOR UPDATE",
+      [purchaseId]
+    );
+    if (pRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Compra no encontrada" });
+    }
+    const existing = pRows[0];
+    if (existing.status === "COMPLETED") {
+      await conn.rollback();
+      return res
+        .status(403)
+        .json({ error: "No se puede eliminar una compra COMPLETED" });
+    }
+
+    // restore stock from details (lock product rows first)
+    const [oldDetails] = await conn.query(
+      "SELECT product_id, quantity FROM purchase_details WHERE purchase_id = ?",
+      [purchaseId]
+    );
+    const productIds = [...new Set(oldDetails.map((d) => d.product_id))];
+    if (productIds.length > 0) {
+      const placeholders = productIds.map(() => "?").join(",");
+      await conn.query(
+        `SELECT id FROM products WHERE id IN (${placeholders}) FOR UPDATE`,
+        productIds
+      );
+    }
+    for (const od of oldDetails) {
+      await conn.query("UPDATE products SET stock = stock + ? WHERE id = ?", [
+        od.quantity,
+        od.product_id,
+      ]);
+    }
+
+    await conn.query("DELETE FROM purchases WHERE id = ?", [purchaseId]);
+    await conn.commit();
+    res.json({ message: "Eliminado" });
+  } catch (err) {
+    await conn.rollback();
+    console.error("/api/purchases DELETE error", err);
+    res.status(500).json({ error: "Error interno" });
+  } finally {
+    conn.release();
+  }
+});
