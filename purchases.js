@@ -194,3 +194,187 @@ router.post("/api/purchases", async (req, res) => {
     conn.release();
   }
 });
+
+// PUT /api/purchases/:id
+router.put("/api/purchases/:id", async (req, res) => {
+  const purchaseId = Number(req.params.id);
+  const { user_id, status, details } = req.body;
+  if (Number.isNaN(purchaseId))
+    return res.status(400).json({ error: "id inválido" });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [pRows] = await conn.query(
+      "SELECT * FROM purchases WHERE id = ? FOR UPDATE",
+      [purchaseId]
+    );
+    if (pRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Compra no encontrada" });
+    }
+    const existing = pRows[0];
+    if (existing.status === "COMPLETED") {
+      await conn.rollback();
+      return res
+        .status(403)
+        .json({ error: "No se puede modificar una compra COMPLETED" });
+    }
+
+    // If details provided, will replace existing details
+    let newTotal = existing.total;
+    if (details !== undefined) {
+      const validationError = validateDetailsArray(details);
+      if (validationError) {
+        await conn.rollback();
+        return res.status(400).json({ error: validationError });
+      }
+
+      // aggregate old and new details by product id
+      const [oldDetails] = await conn.query(
+        "SELECT product_id, quantity FROM purchase_details WHERE purchase_id = ?",
+        [purchaseId]
+      );
+      const oldMap = new Map();
+      for (const od of oldDetails) {
+        oldMap.set(
+          od.product_id,
+          (oldMap.get(od.product_id) || 0) + Number(od.quantity)
+        );
+      }
+
+      let newAgg;
+      try {
+        newAgg = aggregateDetails(details);
+      } catch (e) {
+        if (e && e.status) {
+          await conn.rollback();
+          return res.status(e.status).json({ error: e.message });
+        } else throw e;
+      }
+      newTotal = round2(
+        Array.from(details).reduce(
+          (s, d) => s + Number(d.quantity) * Number(d.price),
+          0
+        )
+      );
+      if (newTotal > 3500) {
+        await conn.rollback();
+        return res
+          .status(400)
+          .json({ error: "El total de la compra no puede pasar $3500" });
+      }
+
+      // lock union of product ids (old U new) in deterministic order
+      const unionIds = Array.from(
+        new Set([
+          ...Array.from(oldMap.keys()).map(Number),
+          ...Array.from(newAgg.keys()).map(Number),
+        ])
+      ).sort((a, b) => a - b);
+      if (unionIds.length > 0) {
+        const placeholders = unionIds.map(() => "?").join(",");
+        const [prodRows] = await conn.query(
+          `SELECT id, stock FROM products WHERE id IN (${placeholders}) FOR UPDATE`,
+          unionIds
+        );
+        const stockById = Object.fromEntries(
+          prodRows.map((r) => [r.id, r.stock])
+        );
+
+        // restore old stock in memory first (we will apply DB updates after validation)
+        for (const [pid, qty] of oldMap.entries()) {
+          // ensure product exists
+          if (stockById[pid] == null) {
+            throw { status: 400, message: `Producto no existe: ${pid}` };
+          }
+          stockById[pid] += qty;
+        }
+
+        // validate new aggregated against restored stocks
+        for (const [pid, info] of newAgg.entries()) {
+          if (stockById[pid] == null) {
+            throw { status: 400, message: `Producto no existe: ${pid}` };
+          }
+          if (stockById[pid] < info.quantity) {
+            throw {
+              status: 409,
+              message: "Stock insuficiente",
+              product_id: pid,
+            };
+          }
+        }
+
+        // apply DB updates: restore old stocks, delete old details, insert new details, decrement by newAgg
+        for (const [pid, qty] of oldMap.entries()) {
+          await conn.query(
+            "UPDATE products SET stock = stock + ? WHERE id = ?",
+            [qty, pid]
+          );
+        }
+
+        await conn.query("DELETE FROM purchase_details WHERE purchase_id = ?", [
+          purchaseId,
+        ]);
+        for (const d of details) {
+          const subtotal = round2(Number(d.quantity) * Number(d.price));
+          await conn.query(
+            "INSERT INTO purchase_details (purchase_id, product_id, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)",
+            [purchaseId, d.product_id, d.quantity, d.price, subtotal]
+          );
+        }
+
+        for (const [pid, info] of newAgg.entries()) {
+          await conn.query(
+            "UPDATE products SET stock = stock - ? WHERE id = ?",
+            [info.quantity, pid]
+          );
+        }
+      }
+    }
+
+    // update purchase record
+    const fields = [];
+    const values = [];
+    if (user_id != null) {
+      // validar existencia de usuario
+      const [urows] = await conn.query("SELECT id FROM users WHERE id = ?", [
+        user_id,
+      ]);
+      if (urows.length === 0) {
+        await conn.rollback();
+        return res.status(400).json({ error: "user_id no existe" });
+      }
+      fields.push("user_id = ?");
+      values.push(user_id);
+    }
+    if (status != null) {
+      fields.push("status = ?");
+      values.push(status);
+    }
+    if (details !== undefined) {
+      fields.push("total = ?");
+      values.push(newTotal);
+      fields.push("updated_at = NOW()");
+    }
+    if (fields.length > 0) {
+      const sql = `UPDATE purchases SET ${fields.join(", ")} WHERE id = ?`;
+      values.push(purchaseId);
+      await conn.query(sql, values);
+    }
+
+    await conn.commit();
+    res.json({ message: "Actualizado" });
+  } catch (err) {
+    await conn.rollback();
+    if (err && err.status)
+      return res
+        .status(err.status)
+        .json({ error: err.message, product_id: err.product_id });
+    console.error("/api/purchases PUT error", err);
+    res.status(500).json({ error: "Error interno" });
+  } finally {
+    conn.release();
+  }
+});
